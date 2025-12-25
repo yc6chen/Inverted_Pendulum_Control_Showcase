@@ -69,22 +69,68 @@ class PIDGains:
 
 
 @dataclass
+class LQRGains:
+    """LQR controller cost matrices.
+
+    The LQR controller minimizes the cost function:
+        J = ∫ (x^T Q x + u^T R u) dt
+
+    Attributes:
+        Q: State cost matrix (4x4) - penalizes state deviations
+           State vector is [x, x_dot, theta, theta_dot]
+        R: Control cost matrix (scalar or 1x1) - penalizes control effort
+    """
+    Q: Tuple[float, float, float, float] = (1.0, 0.0, 10.0, 0.0)
+    R: float = 0.01
+
+    def get_Q_matrix(self) -> 'np.ndarray':
+        """Get Q as a diagonal matrix.
+
+        Returns:
+            4x4 diagonal matrix with Q values on the diagonal
+        """
+        import numpy as np
+        return np.diag(self.Q)
+
+    def get_R_matrix(self) -> 'np.ndarray':
+        """Get R as a 1x1 matrix.
+
+        Returns:
+            1x1 matrix containing R value
+        """
+        import numpy as np
+        return np.array([[self.R]])
+
+
+@dataclass
 class ControlParameters:
     """Control system configuration.
 
     Attributes:
+        controller_type: Type of controller to use ('PID' or 'LQR')
         pid_gains: PID controller gains
+        lqr_gains: LQR controller cost matrices
         saturation_limits: Control force limits (N) as (min, max) tuple
         setpoint: Target angle (rad) - 0.0 for upright pendulum
     """
+    controller_type: str = 'PID'  # 'PID' or 'LQR'
     pid_gains: PIDGains = None
+    lqr_gains: LQRGains = None
     saturation_limits: Optional[Tuple[float, float]] = (-20.0, 20.0)
     setpoint: float = 0.0  # Target angle (rad)
 
     def __post_init__(self):
-        """Initialize default PID gains if not provided."""
+        """Initialize default gains if not provided."""
         if self.pid_gains is None:
             self.pid_gains = PIDGains()
+        if self.lqr_gains is None:
+            self.lqr_gains = LQRGains()
+
+        # Validate controller_type
+        if self.controller_type not in ['PID', 'LQR']:
+            raise ValueError(
+                f"controller_type must be 'PID' or 'LQR', got '{self.controller_type}'"
+            )
 
 
 @dataclass
@@ -130,10 +176,14 @@ class SimulationConfig:
         print(f"  Initial state:        {self.simulation.initial_state}")
 
         print("\nControl Parameters:")
+        print(f"  Controller Type:      {self.control.controller_type}")
         print(f"  PID Gains:")
         print(f"    Kp: {self.control.pid_gains.Kp}")
         print(f"    Ki: {self.control.pid_gains.Ki}")
         print(f"    Kd: {self.control.pid_gains.Kd}")
+        print(f"  LQR Cost Matrices:")
+        print(f"    Q: {self.control.lqr_gains.Q}")
+        print(f"    R: {self.control.lqr_gains.R}")
         print(f"  Saturation limits:    {self.control.saturation_limits} N")
         print(f"  Setpoint:             {self.control.setpoint} rad")
         print("=" * 60)
