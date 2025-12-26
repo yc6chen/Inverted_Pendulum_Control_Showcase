@@ -412,3 +412,302 @@ class LQRController:
             f"LQRController(K={self.K.flatten()}, "
             f"saturation_limits={self.saturation_limits})"
         )
+
+
+class CascadePIDController:
+    """Cascade PID controller for inverted pendulum system.
+
+    This controller uses a two-loop architecture to address the fundamental
+    limitation of single-variable PID control:
+
+    - Inner Loop (Fast): Stabilizes the pendulum angle
+    - Outer Loop (Slow): Controls cart position by adjusting angle setpoint
+
+    This architecture mimics human balancing behavior: to keep a stick upright
+    on your hand, you move your hand (cart) to stay under the stick (pendulum),
+    effectively changing the target angle dynamically.
+
+    The key insight: controlling angle alone causes the cart to run away.
+    By adding position control, we keep the cart centered while balancing.
+
+    Attributes:
+        angle_pid: PID controller for pendulum angle (inner loop)
+        position_pid: PID controller for cart position (outer loop)
+        saturation_limits: Optional (min, max) force output limits
+    """
+
+    def __init__(
+        self,
+        angle_pid_gains: Tuple[float, float, float],
+        position_pid_gains: Tuple[float, float, float],
+        dt: float,
+        saturation_limits: Optional[Tuple[float, float]] = None
+    ) -> None:
+        """Initialize the cascade PID controller.
+
+        Args:
+            angle_pid_gains: (Kp, Ki, Kd) for inner angle control loop
+            position_pid_gains: (Kp, Ki, Kd) for outer position control loop
+            dt: Control timestep (s)
+            saturation_limits: Optional (min, max) output limits for force
+
+        Design Guidelines:
+            - Inner loop (angle) should be faster/more aggressive
+            - Outer loop (position) should be slower/gentler
+            - Typical ratio: inner loop 5-10x faster than outer loop
+        """
+        # Inner loop: controls angle (fast dynamics)
+        self.angle_pid = PIDController(
+            Kp=angle_pid_gains[0],
+            Ki=angle_pid_gains[1],
+            Kd=angle_pid_gains[2],
+            dt=dt,
+            saturation_limits=None  # No saturation on intermediate signal
+        )
+
+        # Outer loop: controls position by setting angle target (slow dynamics)
+        self.position_pid = PIDController(
+            Kp=position_pid_gains[0],
+            Ki=position_pid_gains[1],
+            Kd=position_pid_gains[2],
+            dt=dt,
+            saturation_limits=(-0.15, 0.15)  # Limit angle setpoint to ±8.6 degrees
+        )
+
+        self.saturation_limits = saturation_limits
+
+    def compute(self, state: np.ndarray, position_setpoint: float = 0.0) -> float:
+        """Compute cascade PID control signal.
+
+        The control flow:
+        1. Outer loop: position error → desired angle offset
+        2. Inner loop: (desired angle - actual angle) → force
+
+        Args:
+            state: Current state vector [x, x_dot, theta, theta_dot]
+            position_setpoint: Desired cart position (default: 0.0 m)
+
+        Returns:
+            Control force (N), saturated if limits are set
+        """
+        x, x_dot, theta, theta_dot = state
+
+        # Outer loop: position error determines angle setpoint
+        # Physics: When pendulum leans left (θ < 0), cart accelerates right
+        #          When pendulum leans right (θ > 0), cart accelerates left
+        # Strategy: If cart is too far left (x < 0), lean left (θ < 0) to push it right
+        #           If cart is too far right (x > 0), lean right (θ > 0) to push it left
+        # This is counterintuitive but correct for inverted pendulum!
+        angle_setpoint = -self.position_pid.compute(position_setpoint, x)
+
+        # Inner loop: angle error determines force
+        # The angle_setpoint is the target angle needed to bring cart back
+        force = self.angle_pid.compute(angle_setpoint, theta)
+
+        # Apply force saturation
+        if self.saturation_limits is not None:
+            min_limit, max_limit = self.saturation_limits
+            force = np.clip(force, min_limit, max_limit)
+
+        return force
+
+    def reset(self) -> None:
+        """Reset both inner and outer loop controllers.
+
+        Clears integral accumulators and previous errors in both PIDs.
+        """
+        self.angle_pid.reset()
+        self.position_pid.reset()
+
+    def get_state(self) -> dict:
+        """Get the internal state of both controllers.
+
+        Returns:
+            Dictionary containing:
+                - 'angle_pid_state': Inner loop PID state
+                - 'position_pid_state': Outer loop PID state
+        """
+        return {
+            'angle_pid_state': self.angle_pid.get_state(),
+            'position_pid_state': self.position_pid.get_state()
+        }
+
+    def __repr__(self) -> str:
+        """String representation of the controller."""
+        return (
+            f"CascadePIDController(\n"
+            f"  angle_pid: Kp={self.angle_pid.Kp}, Ki={self.angle_pid.Ki}, "
+            f"Kd={self.angle_pid.Kd}\n"
+            f"  position_pid: Kp={self.position_pid.Kp}, Ki={self.position_pid.Ki}, "
+            f"Kd={self.position_pid.Kd}\n"
+            f"  saturation_limits={self.saturation_limits})"
+        )
+
+
+class GainScheduledCascadePID:
+    """Gain-scheduled cascade PID controller for inverted pendulum.
+
+    This controller adapts its gains based on the system state, using different
+    control strategies for different operating regions:
+
+    - Large angle (emergency): Aggressive angle control to prevent falling
+    - Medium angle (stabilizing): Balanced control for convergence
+    - Small angle (fine-tuning): Gentle control with position correction
+
+    Gain scheduling improves performance across the entire operating range,
+    addressing PID's limitation of fixed gains that can't adapt to varying dynamics.
+
+    Attributes:
+        gain_sets: Dictionary of gain sets for different operating regions
+        saturation_limits: Force output limits
+        current_mode: Current operating mode for diagnostics
+    """
+
+    def __init__(
+        self,
+        dt: float,
+        saturation_limits: Optional[Tuple[float, float]] = None
+    ) -> None:
+        """Initialize gain-scheduled cascade PID controller.
+
+        Args:
+            dt: Control timestep (s)
+            saturation_limits: Optional (min, max) output limits for force
+        """
+        self.dt = dt
+        self.saturation_limits = saturation_limits
+        self.current_mode = "INIT"
+
+        # Define gain sets for different operating regions
+        # Format: (angle_Kp, angle_Ki, angle_Kd, position_Kp, position_Ki, position_Kd)
+        self.gain_sets = {
+            # Emergency mode: |theta| > 15° - Focus on angle, ignore position
+            'emergency': {
+                'angle': (150.0, 0.5, 40.0),     # Very aggressive angle control
+                'position': (0.0, 0.0, 0.0),     # No position control (would interfere)
+                'angle_limit': 0.5               # Wider angle setpoint limit
+            },
+            # Stabilization mode: 5° < |theta| < 15° - Balance angle and position
+            'stabilizing': {
+                'angle': (120.0, 2.0, 35.0),     # Strong angle control
+                'position': (0.8, 0.0, 3.0),     # Moderate position control
+                'angle_limit': 0.2               # ~11° limit
+            },
+            # Fine-tuning mode: |theta| < 5° - Refine position, gentle angle
+            'fine_tuning': {
+                'angle': (80.0, 5.0, 25.0),      # Moderate angle control
+                'position': (1.5, 0.1, 5.0),     # Strong position control
+                'angle_limit': 0.15              # ~8.6° limit
+            }
+        }
+
+        # Create PID controllers (will be updated with gain scheduling)
+        self._create_controllers('fine_tuning')
+
+    def _create_controllers(self, mode: str) -> None:
+        """Create or update PID controllers for specified mode.
+
+        Args:
+            mode: Operating mode ('emergency', 'stabilizing', or 'fine_tuning')
+        """
+        gains = self.gain_sets[mode]
+
+        # Inner loop: angle control
+        self.angle_pid = PIDController(
+            Kp=gains['angle'][0],
+            Ki=gains['angle'][1],
+            Kd=gains['angle'][2],
+            dt=self.dt,
+            saturation_limits=None
+        )
+
+        # Outer loop: position control
+        self.position_pid = PIDController(
+            Kp=gains['position'][0],
+            Ki=gains['position'][1],
+            Kd=gains['position'][2],
+            dt=self.dt,
+            saturation_limits=(-gains['angle_limit'], gains['angle_limit'])
+        )
+
+        self.current_mode = mode
+
+    def _select_mode(self, theta: float) -> str:
+        """Select operating mode based on pendulum angle.
+
+        Args:
+            theta: Pendulum angle (rad)
+
+        Returns:
+            Operating mode string
+        """
+        theta_abs = abs(theta)
+
+        if theta_abs > np.deg2rad(15):  # > 15 degrees
+            return 'emergency'
+        elif theta_abs > np.deg2rad(5):  # 5-15 degrees
+            return 'stabilizing'
+        else:  # < 5 degrees
+            return 'fine_tuning'
+
+    def compute(self, state: np.ndarray, position_setpoint: float = 0.0) -> float:
+        """Compute gain-scheduled cascade PID control signal.
+
+        Automatically selects appropriate gains based on current state and
+        applies cascade control strategy.
+
+        Args:
+            state: Current state vector [x, x_dot, theta, theta_dot]
+            position_setpoint: Desired cart position (default: 0.0 m)
+
+        Returns:
+            Control force (N), saturated if limits are set
+        """
+        x, x_dot, theta, theta_dot = state
+
+        # Select and apply appropriate gain set
+        desired_mode = self._select_mode(theta)
+        if desired_mode != self.current_mode:
+            # Preserve controller states when switching modes
+            old_angle_state = self.angle_pid.get_state()
+            old_position_state = self.position_pid.get_state()
+
+            self._create_controllers(desired_mode)
+
+            # Restore states to prevent discontinuities
+            # (Only restore integral to maintain smoothness)
+            self.angle_pid._integral = old_angle_state['integral'] * 0.5  # Decay integral
+            self.position_pid._integral = old_position_state['integral'] * 0.5
+
+        # Cascade control with corrected sign
+        angle_setpoint = -self.position_pid.compute(position_setpoint, x)
+        force = self.angle_pid.compute(angle_setpoint, theta)
+
+        # Apply force saturation
+        if self.saturation_limits is not None:
+            force = np.clip(force, *self.saturation_limits)
+
+        return force
+
+    def reset(self) -> None:
+        """Reset controller to initial state."""
+        self._create_controllers('fine_tuning')
+
+    def get_current_mode(self) -> str:
+        """Get the current operating mode.
+
+        Returns:
+            Current mode string
+        """
+        return self.current_mode
+
+    def __repr__(self) -> str:
+        """String representation of the controller."""
+        return (
+            f"GainScheduledCascadePID(\n"
+            f"  current_mode={self.current_mode}\n"
+            f"  angle_pid: Kp={self.angle_pid.Kp}, Ki={self.angle_pid.Ki}, "
+            f"Kd={self.angle_pid.Kd}\n"
+            f"  position_pid: Kp={self.position_pid.Kp}, Ki={self.position_pid.Ki}, "
+            f"Kd={self.position_pid.Kd})"
+        )
