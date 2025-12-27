@@ -127,9 +127,10 @@ class ControlParameters:
             self.lqr_gains = LQRGains()
 
         # Validate controller_type
-        if self.controller_type not in ['PID', 'LQR']:
+        valid_types = ['PID', 'CASCADE_PID', 'GAIN_SCHEDULED_PID', 'LQR']
+        if self.controller_type not in valid_types:
             raise ValueError(
-                f"controller_type must be 'PID' or 'LQR', got '{self.controller_type}'"
+                f"controller_type must be one of {valid_types}, got '{self.controller_type}'"
             )
 
 
